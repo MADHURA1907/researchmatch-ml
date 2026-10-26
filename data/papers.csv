@@ -1,0 +1,14 @@
+
+id,title,abstract,category,year,url
+1,Attention Is All You Need,"Introduces the Transformer architecture based entirely on attention mechanisms for sequence modeling and machine translation.",NLP,2017,https://arxiv.org/abs/1706.03762
+2,BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding,"Uses bidirectional Transformer pretraining to improve language understanding across question answering and other NLP tasks.",NLP,2018,https://arxiv.org/abs/1810.04805
+3,Language Models are Few-Shot Learners,"Studies large autoregressive language models and their ability to perform tasks from natural language prompts and few examples.",Generative AI,2020,https://arxiv.org/abs/2005.14165
+4,Deep Residual Learning for Image Recognition,"Introduces residual connections that enable very deep neural networks to learn effective image representations.",Computer Vision,2015,https://arxiv.org/abs/1512.03385
+5,U-Net: Convolutional Networks for Biomedical Image Segmentation,"Presents an encoder-decoder convolutional architecture with skip connections for biomedical image segmentation.",Computer Vision,2015,https://arxiv.org/abs/1505.04597
+6,ImageNet Classification with Deep Convolutional Neural Networks,"Demonstrates a deep convolutional neural network for large-scale image classification.",Computer Vision,2012,https://proceedings.neurips.cc/paper/2012/hash/c399862d3b9d6b76c8436e924a68c45b-Abstract.html
+7,Adam: A Method for Stochastic Optimization,"Introduces an adaptive optimization algorithm using estimates of first and second moments of gradients.",Optimization,2014,https://arxiv.org/abs/1412.6980
+8,Dropout: A Simple Way to Prevent Neural Networks from Overfitting,"Introduces dropout regularization to reduce overfitting in neural networks.",Deep Learning,2012,https://jmlr.org/papers/v15/srivastava14a.html
+9,LoRA: Low-Rank Adaptation of Large Language Models,"Adapts pretrained language models efficiently by learning low-rank updates to model weights.",Generative AI,2021,https://arxiv.org/abs/2106.09685
+10,Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks,"Combines neural retrieval with text generation to improve access to external knowledge for language tasks.",Generative AI,2020,https://arxiv.org/abs/2005.11401
+11,An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale,"Applies Transformer architectures to image patches for image classification.",Computer Vision,2020,https://arxiv.org/abs/2010.11929
+12,Denoising Diffusion Probabilistic Models,"Develops a generative modeling approach that learns to generate samples by reversing a gradual noising process.",Generative AI,2020,https://arxiv.org/abs/2006.11239
