@@ -78,9 +78,29 @@ if query.strip():
     results = results.head(top_k)
 
     st.subheader("Recommended papers")
-    st.caption(
-        f"{len(results)} results ranked by textual similarity"
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Matching papers", len(results))
+    col2.metric(
+        "Research areas",
+        results["category"].nunique() if not results.empty else 0,
     )
+    col3.metric(
+        "Best similarity",
+        f"{results['similarity'].max():.1%}"
+        if not results.empty else "—",
+    )
+
+    if not results.empty:
+        export_columns = [
+            "title", "category", "year", "similarity", "url"
+        ]
+        st.download_button(
+            "Download recommendations as CSV",
+            data=results[export_columns].to_csv(index=False),
+            file_name="researchmatch_recommendations.csv",
+            mime="text/csv",
+        )
 
     if results.empty:
         st.info(
