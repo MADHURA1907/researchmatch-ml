@@ -44,9 +44,15 @@ def load_papers(data_path=DEFAULT_DATA_PATH):
 
 def build_recommender(papers):
     """Create TF-IDF vectors from paper titles and abstracts."""
+    
     documents = (
-        papers["title"] + " " + papers["abstract"]
+        papers["title"].fillna("").astype(str)
+        + " "
+        + papers["abstract"].fillna("").astype(str)
+        + " "
+        + papers["category"].fillna("").astype(str)
     ).tolist()
+
 
     vectorizer = TfidfVectorizer(
         stop_words="english",
