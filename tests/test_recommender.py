@@ -60,3 +60,39 @@ def test_top_k_must_be_positive(recommender):
             matrix,
             top_k=0,
         )
+
+
+def test_recommendations_have_valid_similarity_scores(recommender):
+    papers, vectorizer, matrix = recommender
+    results = recommend_papers(
+        "computer vision",
+        papers,
+        vectorizer,
+        matrix,
+        top_k=5,
+    )
+
+    assert not results.empty
+    assert results["similarity"].between(0, 1).all()
+    assert results["similarity"].is_monotonic_decreasing
+
+
+def test_top_k_limits_number_of_results(recommender):
+    papers, vectorizer, matrix = recommender
+    results = recommend_papers(
+        "generative AI",
+        papers,
+        vectorizer,
+        matrix,
+        top_k=2,
+    )
+
+    assert len(results) <= 2
+
+
+def test_invalid_dataset_path_raises_error():
+    with pytest.raises((FileNotFoundError, OSError)):
+        load_papers("data/does_not_exist.csv")
+
+
+
