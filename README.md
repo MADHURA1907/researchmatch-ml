@@ -90,3 +90,33 @@ should not be interpreted as paper quality or prediction accuracy.
 ## License
 
 A license has not yet been selected.
+
+
+## Deployment
+
+ResearchMatch can be deployed using Streamlit Community Cloud.
+
+1. Push the project to GitHub.
+2. Open https://share.streamlit.io/
+3. Sign in with GitHub and authorize access to the repository.
+4. Create a new app and select `MADHURA1907/researchmatch-ml`.
+5. Set the main file path to `app.py`.
+6. Deploy and test the public application.
+
+The app uses the repository's `requirements.txt` to install its
+Python dependencies.
+
+## Project Health Check
+
+Run the following command locally before publishing changes:
+
+```bash
+python check_project.py
+```
+
+Run automated tests with:
+
+```bash
+python -m pytest tests/ -v
+```
+
