@@ -394,3 +394,78 @@ def get_related_papers(
     )
 
     return results.head(top_k).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# BibTeX Export Utility
+# ---------------------------------------------------------------------------
+
+def escape_bibtex(text: Any) -> str:
+    """Escape special BibTeX characters in text values."""
+    if text is None or pd.isna(text):
+        return ""
+    val = str(text)
+    val = val.replace("\\", r"\textbackslash{}")
+    replacements = {
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    for char, rep in replacements.items():
+        val = val.replace(char, rep)
+    return val
+
+
+def export_to_bibtex(papers: pd.DataFrame) -> str:
+    """Generate valid BibTeX citation entries for research papers.
+
+    Only uses metadata actually available in the dataset (does NOT invent missing authors).
+    """
+    if papers is None or papers.empty:
+        return ""
+
+    entries = []
+    for _, paper in papers.iterrows():
+        pid = paper.get("id", "unknown")
+        title = paper.get("title", "Untitled")
+        words = str(title).split()
+        first_word = "".join(filter(str.isalnum, words[0])) if words else "paper"
+        year_val = paper.get("year")
+        try:
+            year_str = str(int(year_val)) if pd.notna(year_val) else ""
+        except (ValueError, TypeError):
+            year_str = ""
+        cite_key = f"{first_word.lower()}{year_str}_{pid}"
+
+        fields = [f"  title = {{{escape_bibtex(title)}}}"]
+
+        if "author" in paper and pd.notna(paper["author"]) and str(paper["author"]).strip():
+            fields.append(f"  author = {{{escape_bibtex(paper['author'])}}}")
+        elif "authors" in paper and pd.notna(paper["authors"]) and str(paper["authors"]).strip():
+            fields.append(f"  author = {{{escape_bibtex(paper['authors'])}}}")
+
+        if year_str:
+            fields.append(f"  year = {{{year_str}}}")
+
+        category = paper.get("category")
+        if pd.notna(category) and str(category).strip():
+            fields.append(f"  journal = {{{escape_bibtex(category)}}}")
+
+        url = paper.get("url")
+        if pd.notna(url) and str(url).strip():
+            fields.append(f"  url = {{{str(url).strip()}}}")
+
+        fields.append("  note = {Accessed via ResearchMatch ML}")
+
+        field_lines = ",\n".join(fields)
+        entry = f"@article{{{cite_key},\n{field_lines}\n}}"
+        entries.append(entry)
+
+    return "\n\n".join(entries)
+

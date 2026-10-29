@@ -6,6 +6,8 @@ import pandas as pd
 import pytest
 
 from src.recommender import (
+    escape_bibtex,
+    export_to_bibtex,
     DEFAULT_RRF_K,
     build_recommender,
     build_semantic_embeddings,
@@ -322,3 +324,52 @@ def test_real_semantic_model_smoke(recommender):
     assert not results.empty
     # Attention Is All You Need should be top-ranked for this query
     assert "Attention Is All You Need" in results.iloc[0]["title"]
+
+
+# ---------------------------------------------------------------------------
+# BibTeX Export Tests
+# ---------------------------------------------------------------------------
+
+def test_escape_bibtex_characters():
+    assert escape_bibtex("Deep & Fast: 50% Speedup ($100) {v1}") == r"Deep \& Fast: 50\% Speedup (\$100) \{v1\}"
+    assert escape_bibtex(None) == ""
+    assert escape_bibtex(np.nan) == ""
+
+
+def test_export_to_bibtex_empty():
+    assert export_to_bibtex(pd.DataFrame()) == ""
+    assert export_to_bibtex(None) == ""
+
+
+def test_export_to_bibtex_structure(recommender):
+    papers, _, _ = recommender
+    sample = papers.head(2)
+    bibtex = export_to_bibtex(sample)
+
+    assert "@article{" in bibtex
+    assert "title = {" in bibtex
+    assert "year = {" in bibtex
+    assert "journal = {" in bibtex
+    assert "url = {" in bibtex
+    assert "Accessed via ResearchMatch ML" in bibtex
+    # Verify no fake author is generated
+    assert "author = {" not in bibtex
+
+
+def test_export_to_bibtex_with_author_if_present():
+    df = pd.DataFrame([{
+        "id": 101,
+        "title": "Quantum & Neural Computation",
+        "abstract": "A study on quantum neural nets.",
+        "category": "Quantum ML",
+        "year": 2024,
+        "url": "https://example.com/quantum",
+        "author": "Alice Smith & Bob Jones",
+    }])
+
+    bibtex = export_to_bibtex(df)
+    assert "@article{quantum2024_101," in bibtex
+    assert r"title = {Quantum \& Neural Computation}" in bibtex
+    assert r"author = {Alice Smith \& Bob Jones}" in bibtex
+    assert "year = {2024}" in bibtex
+
