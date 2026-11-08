@@ -1,0 +1,13 @@
+[project]
+name = "researchmatch-ml"
+version = "0.1.0"
+description = "A research paper discovery and recommendation platform."
+readme = "README.md"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+    "network: marks tests as requiring network access or external model downloads",
+]
