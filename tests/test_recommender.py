@@ -1,11 +1,12 @@
 """Unit tests for ResearchMatch recommendation engine."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 import pytest
 
 from src.recommender import (
+    DEFAULT_CANDIDATE_POOL_SIZE,
     DEFAULT_RRF_K,
     build_recommender,
     build_semantic_embeddings,
@@ -21,6 +22,7 @@ from src.recommender import (
     recommend_papers,
     recommend_semantic,
     save_embeddings,
+    search_papers,
     validate_embeddings,
 )
 
@@ -251,6 +253,386 @@ def test_recommend_hybrid_empty_query(recommender, mock_embedding_env):
         semantic_model=mock_model,
     )
     assert results.empty
+
+
+def test_recommend_hybrid_candidate_pooling_equivalence(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    # Full corpus unpooled
+    res_unpooled = recommend_hybrid(
+        query="transformer language models",
+        papers=papers,
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=4,
+        candidate_pool_size=None,
+    )
+
+    # Explicit pool size equal to corpus size
+    res_pooled = recommend_hybrid(
+        query="transformer language models",
+        papers=papers,
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=4,
+        candidate_pool_size=len(papers),
+    )
+
+    assert not res_unpooled.empty
+    assert len(res_unpooled) == len(res_pooled)
+    assert list(res_unpooled["id"]) == list(res_pooled["id"])
+    assert np.allclose(res_unpooled["rrf_score"], res_pooled["rrf_score"])
+
+
+def test_recommend_hybrid_candidate_pool_size_clamping(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    # When candidate_pool_size < top_k, pool depth is clamped to at least top_k
+    results = recommend_hybrid(
+        query="transformer models",
+        papers=papers,
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=5,
+        candidate_pool_size=2,
+    )
+    assert not results.empty
+    assert len(results) <= 5
+
+    # When candidate_pool_size <= 0, raises ValueError
+    with pytest.raises(ValueError, match="candidate_pool_size must be at least 1"):
+        recommend_hybrid(
+            query="test",
+            papers=papers,
+            vectorizer=vectorizer,
+            tfidf_matrix=tfidf_matrix,
+            semantic_embeddings=embeddings,
+            semantic_model=mock_model,
+            candidate_pool_size=0,
+        )
+
+
+def test_recommend_hybrid_candidate_pooling_limits_candidates(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    with patch("src.recommender.recommend_papers", wraps=recommend_papers) as mock_lex, \
+         patch("src.recommender.recommend_semantic", wraps=recommend_semantic) as mock_sem:
+        recommend_hybrid(
+            query="transformer",
+            papers=papers,
+            vectorizer=vectorizer,
+            tfidf_matrix=tfidf_matrix,
+            semantic_embeddings=embeddings,
+            semantic_model=mock_model,
+            top_k=2,
+            candidate_pool_size=4,
+        )
+        assert mock_lex.call_count == 1
+        assert mock_sem.call_count == 1
+        assert mock_lex.call_args[1]["top_k"] == 4
+        assert mock_sem.call_args[1]["top_k"] == 4
+
+
+def test_recommend_hybrid_pure_lexical_weight(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    lexical_only = recommend_hybrid(
+        query="transformer",
+        papers=papers,
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=3,
+        lexical_weight=1.0,
+        semantic_weight=0.0,
+    )
+    lexical_baseline = recommend_papers(
+        query="transformer",
+        papers=papers,
+        vectorizer=vectorizer,
+        matrix=tfidf_matrix,
+        top_k=3,
+    )
+    assert not lexical_only.empty
+    assert lexical_only.iloc[0]["id"] == lexical_baseline.iloc[0]["id"]
+
+
+def test_recommend_hybrid_pure_semantic_weight(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    semantic_only = recommend_hybrid(
+        query="transformer",
+        papers=papers,
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=3,
+        lexical_weight=0.0,
+        semantic_weight=1.0,
+    )
+    semantic_baseline = recommend_semantic(
+        query="transformer",
+        papers=papers,
+        embeddings=embeddings,
+        model=mock_model,
+        top_k=3,
+    )
+    assert not semantic_only.empty
+    assert semantic_only.iloc[0]["id"] == semantic_baseline.iloc[0]["id"]
+
+
+def test_recommend_hybrid_invalid_weights_or_k(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    # Negative weights
+    with pytest.raises(ValueError, match="must be non-negative"):
+        recommend_hybrid("q", papers, vectorizer, tfidf_matrix, embeddings, lexical_weight=-1.0)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        recommend_hybrid("q", papers, vectorizer, tfidf_matrix, embeddings, semantic_weight=-0.5)
+
+    # Both weights zero
+    with pytest.raises(ValueError, match="At least one.*must be positive"):
+        recommend_hybrid("q", papers, vectorizer, tfidf_matrix, embeddings, lexical_weight=0.0, semantic_weight=0.0)
+
+    # Invalid rrf_k
+    with pytest.raises(ValueError, match="rrf_k must be at least 1"):
+        recommend_hybrid("q", papers, vectorizer, tfidf_matrix, embeddings, rrf_k=0)
+
+
+def test_recommend_hybrid_tie_breaking_determinism():
+    papers = pd.DataFrame([
+        {
+            "id": 99,
+            "title": "Identical Paper Title",
+            "abstract": "Identical abstract for testing tie breaks.",
+            "category": "Computer Science",
+            "year": 2024,
+            "url": "https://example.com/99",
+        },
+        {
+            "id": 42,
+            "title": "Identical Paper Title",
+            "abstract": "Identical abstract for testing tie breaks.",
+            "category": "Computer Science",
+            "year": 2024,
+            "url": "https://example.com/42",
+        },
+    ])
+    vectorizer, matrix = build_recommender(papers)
+    embeddings = np.ones((2, 8), dtype=np.float32)
+    mock_model = MagicMock()
+    mock_model.encode.return_value = np.ones((1, 8), dtype=np.float32)
+
+    # Run 1: original order (id 99 first in df, id 42 second)
+    res1 = recommend_hybrid(
+        query="identical abstract",
+        papers=papers,
+        vectorizer=vectorizer,
+        tfidf_matrix=matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=2,
+    )
+    # ID 42 should be ranked first because of ascending ID tie-breaker
+    assert list(res1["id"]) == [42, 99]
+
+    # Run 2: reversed DataFrame order (id 42 first in df, id 99 second)
+    papers_rev = papers.iloc[::-1].reset_index(drop=True)
+    matrix_rev = matrix[::-1]
+    res2 = recommend_hybrid(
+        query="identical abstract",
+        papers=papers_rev,
+        vectorizer=vectorizer,
+        tfidf_matrix=matrix_rev,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=2,
+    )
+    assert list(res2["id"]) == [42, 99]
+
+
+# ---------------------------------------------------------------------------
+# Unified Search Dispatcher (search_papers)
+# ---------------------------------------------------------------------------
+
+def test_search_papers_modes(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    # Hybrid mode
+    res_hyb, col_hyb, label_hyb = search_papers(
+        query="transformer",
+        papers=papers,
+        mode="hybrid",
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=3,
+    )
+    assert col_hyb == "rrf_score"
+    assert label_hyb == "RRF Ranking Score"
+    assert "rrf_score" in res_hyb.columns
+    assert len(res_hyb) <= 3
+
+    # Semantic mode
+    res_sem, col_sem, label_sem = search_papers(
+        query="transformer",
+        papers=papers,
+        mode="semantic",
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=3,
+    )
+    assert col_sem == "similarity"
+    assert label_sem == "Semantic Cosine Similarity"
+    assert "similarity" in res_sem.columns
+
+    # Lexical mode
+    res_lex, col_lex, label_lex = search_papers(
+        query="transformer",
+        papers=papers,
+        mode="lexical",
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        top_k=3,
+    )
+    assert col_lex == "similarity"
+    assert label_lex == "Lexical Similarity (TF-IDF)"
+    assert "similarity" in res_lex.columns
+
+    # UI mode string resolution
+    res_ui, col_ui, label_ui = search_papers(
+        query="transformer",
+        papers=papers,
+        mode="Hybrid (TF-IDF + Dense RRF)",
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=3,
+    )
+    assert col_ui == "rrf_score"
+
+
+def test_search_papers_fallback_when_semantic_missing(recommender):
+    papers, vectorizer, tfidf_matrix = recommender
+
+    # Hybrid requested without embeddings -> fallback to lexical
+    res, score_col, label = search_papers(
+        query="transformer",
+        papers=papers,
+        mode="hybrid",
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=None,
+    )
+    assert score_col == "similarity"
+    assert "Fallback" in label
+    assert not res.empty
+
+    # Semantic requested without embeddings -> fallback to lexical
+    res2, score_col2, label2 = search_papers(
+        query="transformer",
+        papers=papers,
+        mode="semantic",
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=None,
+    )
+    assert score_col2 == "similarity"
+    assert "Fallback" in label2
+    assert not res2.empty
+
+
+def test_search_papers_fallback_missing_vectorizer_raises(recommender):
+    papers, _, _ = recommender
+    with pytest.raises(ValueError, match="vectorizer and tfidf_matrix must be provided"):
+        search_papers(
+            query="transformer",
+            papers=papers,
+            mode="hybrid",
+            semantic_embeddings=None,
+            vectorizer=None,
+            tfidf_matrix=None,
+        )
+
+
+def test_search_papers_invalid_mode_raises(recommender):
+    papers, vectorizer, tfidf_matrix = recommender
+    with pytest.raises(ValueError, match="Invalid retrieval mode"):
+        search_papers("transformer", papers, mode="random_search")
+
+    with pytest.raises(ValueError, match="mode must be a string"):
+        search_papers("transformer", papers, mode=123)
+
+
+def test_search_papers_empty_query(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    # Hybrid empty query
+    res, col, _ = search_papers(
+        query="   ",
+        papers=papers,
+        mode="hybrid",
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+    )
+    assert res.empty
+    assert col == "rrf_score"
+
+    # Semantic empty query
+    res_s, col_s, _ = search_papers(
+        query="",
+        papers=papers,
+        mode="semantic",
+        semantic_embeddings=embeddings,
+    )
+    assert res_s.empty
+    assert col_s == "similarity"
+
+
+def test_search_papers_invalid_top_k(recommender):
+    papers, vectorizer, tfidf_matrix = recommender
+    with pytest.raises(ValueError, match="top_k must be at least 1"):
+        search_papers("query", papers, top_k=0, vectorizer=vectorizer, tfidf_matrix=tfidf_matrix)
+
+
+def test_search_papers_candidate_pool_size(recommender, mock_embedding_env):
+    papers, vectorizer, tfidf_matrix = recommender
+    _, embeddings, mock_model = mock_embedding_env
+
+    res, col, _ = search_papers(
+        query="transformer",
+        papers=papers,
+        mode="hybrid",
+        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
+        semantic_embeddings=embeddings,
+        semantic_model=mock_model,
+        top_k=2,
+        candidate_pool_size=4,
+    )
+    assert not res.empty
+    assert len(res) <= 2
+    assert col == "rrf_score"
 
 
 # ---------------------------------------------------------------------------

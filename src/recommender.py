@@ -28,6 +28,7 @@ DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "papers.csv"
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "embeddings_cache"
 DEFAULT_SEMANTIC_MODEL = "all-MiniLM-L6-v2"
 DEFAULT_RRF_K = 60
+DEFAULT_CANDIDATE_POOL_SIZE = 50
 
 REQUIRED_COLUMNS = {"id", "title", "abstract", "category", "year", "url"}
 
@@ -134,9 +135,14 @@ def recommend_papers(
     results["similarity"] = scores
 
     results = results[results["similarity"] > 0]
+    sort_cols = ["similarity", "title"]
+    sort_asc = [False, True]
+    if "id" in results.columns:
+        sort_cols.append("id")
+        sort_asc.append(True)
     results = results.sort_values(
-        by=["similarity", "title"],
-        ascending=[False, True],
+        by=sort_cols,
+        ascending=sort_asc,
     )
 
     return results.head(top_k).reset_index(drop=True)
@@ -373,9 +379,14 @@ def recommend_semantic(
 
     # Filter out near-zero or negative similarity
     results = results[results["similarity"] > 0]
+    sort_cols = ["similarity", "title"]
+    sort_asc = [False, True]
+    if "id" in results.columns:
+        sort_cols.append("id")
+        sort_asc.append(True)
     results = results.sort_values(
-        by=["similarity", "title"],
-        ascending=[False, True],
+        by=sort_cols,
+        ascending=sort_asc,
     )
 
     return results.head(top_k).reset_index(drop=True)
@@ -396,6 +407,7 @@ def recommend_hybrid(
     rrf_k: int = DEFAULT_RRF_K,
     lexical_weight: float = 1.0,
     semantic_weight: float = 1.0,
+    candidate_pool_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """Combine lexical (TF-IDF) and semantic (Dense) search using Reciprocal Rank Fusion.
 
@@ -405,6 +417,10 @@ def recommend_hybrid(
     where rank_m(d) is the 1-based rank of paper d in retriever m's candidate list.
     RRF operates on ordinal ranking rather than raw scores, making it robust against
     incomparable score distributions.
+
+    Candidate pooling: When `candidate_pool_size` is specified, only the top candidates
+    from each retriever are merged, improving retrieval speed on large corpora while
+    ensuring at least `top_k` candidates are evaluated.
 
     NOTE: The 'rrf_score' is a ranking signal, NOT a probability or accuracy metric.
     """
@@ -417,12 +433,36 @@ def recommend_hybrid(
     if top_k < 1:
         raise ValueError("top_k must be at least 1.")
 
-    # Retrieve all matches from both engines
+    if rrf_k < 1:
+        raise ValueError("rrf_k must be at least 1.")
+
+    if lexical_weight < 0 or semantic_weight < 0:
+        raise ValueError("lexical_weight and semantic_weight must be non-negative.")
+
+    if lexical_weight == 0 and semantic_weight == 0:
+        raise ValueError("At least one of lexical_weight or semantic_weight must be positive.")
+
+    if candidate_pool_size is not None and candidate_pool_size < 1:
+        raise ValueError("candidate_pool_size must be at least 1.")
+
+    if papers.empty:
+        return papers.iloc[0:0].assign(
+            similarity=pd.Series(dtype=float),
+            rrf_score=pd.Series(dtype=float),
+        )
+
+    # Determine candidate pool depth
+    if candidate_pool_size is None or candidate_pool_size >= len(papers):
+        pool_depth = len(papers)
+    else:
+        pool_depth = min(len(papers), max(top_k, candidate_pool_size))
+
+    # Retrieve candidates from both engines
     lexical_results = recommend_papers(
-        query, papers, vectorizer, tfidf_matrix, top_k=len(papers)
+        query, papers, vectorizer, tfidf_matrix, top_k=pool_depth
     )
     semantic_results = recommend_semantic(
-        query, papers, semantic_embeddings, model=semantic_model, top_k=len(papers)
+        query, papers, semantic_embeddings, model=semantic_model, top_k=pool_depth
     )
 
     if lexical_results.empty and semantic_results.empty:
@@ -454,9 +494,9 @@ def recommend_hybrid(
         l_rank = lexical_ranks.get(pid)
         s_rank = semantic_ranks.get(pid)
 
-        if l_rank is not None:
+        if l_rank is not None and lexical_weight > 0:
             score += lexical_weight / (rrf_k + l_rank)
-        if s_rank is not None:
+        if s_rank is not None and semantic_weight > 0:
             score += semantic_weight / (rrf_k + s_rank)
 
         records.append({
@@ -474,12 +514,195 @@ def recommend_hybrid(
     # Set similarity to rrf_score for interface compatibility
     merged["similarity"] = merged["rrf_score"]
 
+    sort_cols = ["rrf_score", "semantic_score", "title"]
+    sort_asc = [False, False, True]
+    if "id" in merged.columns:
+        sort_cols.append("id")
+        sort_asc.append(True)
+
     merged = merged.sort_values(
-        by=["rrf_score", "semantic_score", "title"],
-        ascending=[False, False, True],
+        by=sort_cols,
+        ascending=sort_asc,
     )
 
     return merged.head(top_k).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Unified Search Dispatcher
+# ---------------------------------------------------------------------------
+
+def search_papers(
+    query: str,
+    papers: pd.DataFrame,
+    mode: str = "hybrid",
+    top_k: int = 5,
+    vectorizer: Optional[TfidfVectorizer] = None,
+    tfidf_matrix: Optional[Any] = None,
+    semantic_embeddings: Optional[np.ndarray] = None,
+    semantic_model: Optional[Any] = None,
+    rrf_k: int = DEFAULT_RRF_K,
+    lexical_weight: float = 1.0,
+    semantic_weight: float = 1.0,
+    candidate_pool_size: Optional[int] = None,
+) -> Tuple[pd.DataFrame, str, str]:
+    """Unified retrieval dispatcher for Lexical, Semantic, and Hybrid search.
+
+    Routes queries to the appropriate search engine based on `mode`:
+    - 'hybrid': Reciprocal Rank Fusion of TF-IDF and Semantic embeddings.
+    - 'semantic': Dense embedding cosine similarity via sentence-transformers.
+    - 'lexical' (or 'tfidf'): Sparse TF-IDF n-gram cosine similarity.
+
+    Gracefully falls back to lexical retrieval if semantic embeddings are unavailable
+    when 'hybrid' or 'semantic' mode is requested.
+
+    Returns:
+        Tuple of (results_df, score_column_name, metric_label):
+        - results_df: pd.DataFrame containing the ranked paper metadata and scores.
+        - score_column_name: Name of the primary ranking score column ("rrf_score" or "similarity").
+        - metric_label: Human-readable label for UI rendering (e.g. "RRF Ranking Score").
+    """
+    if not isinstance(mode, str):
+        raise ValueError(f"mode must be a string, got {type(mode).__name__}.")
+
+    clean_mode = mode.strip().lower()
+    if "hybrid" in clean_mode:
+        resolved_mode = "hybrid"
+    elif "semantic" in clean_mode:
+        resolved_mode = "semantic"
+    elif "lexical" in clean_mode or "tfidf" in clean_mode or "tf-idf" in clean_mode:
+        resolved_mode = "lexical"
+    else:
+        raise ValueError(
+            f"Invalid retrieval mode '{mode}'. Supported modes are 'hybrid', 'semantic', 'lexical'."
+        )
+
+    if top_k < 1:
+        raise ValueError("top_k must be at least 1.")
+
+    # Handle empty query early
+    if not isinstance(query, str) or not query.strip():
+        if resolved_mode == "hybrid":
+            if semantic_embeddings is None:
+                logger.warning(
+                    "Semantic embeddings unavailable. Falling back to Lexical (TF-IDF) search."
+                )
+                return (
+                    papers.iloc[0:0].assign(similarity=pd.Series(dtype=float)),
+                    "similarity",
+                    "Lexical Similarity (TF-IDF - Fallback)",
+                )
+            return (
+                papers.iloc[0:0].assign(
+                    similarity=pd.Series(dtype=float),
+                    rrf_score=pd.Series(dtype=float),
+                ),
+                "rrf_score",
+                "RRF Ranking Score",
+            )
+        elif resolved_mode == "semantic":
+            if semantic_embeddings is None:
+                logger.warning(
+                    "Semantic embeddings unavailable. Falling back to Lexical (TF-IDF) search."
+                )
+                return (
+                    papers.iloc[0:0].assign(similarity=pd.Series(dtype=float)),
+                    "similarity",
+                    "Lexical Similarity (TF-IDF - Fallback)",
+                )
+            return (
+                papers.iloc[0:0].assign(similarity=pd.Series(dtype=float)),
+                "similarity",
+                "Semantic Cosine Similarity",
+            )
+        else:
+            return (
+                papers.iloc[0:0].assign(similarity=pd.Series(dtype=float)),
+                "similarity",
+                "Lexical Similarity (TF-IDF)",
+            )
+
+    # Route according to mode with graceful fallback
+    if resolved_mode == "hybrid":
+        if semantic_embeddings is None:
+            logger.warning(
+                "Semantic embeddings unavailable for hybrid retrieval. "
+                "Falling back to Lexical (TF-IDF) search."
+            )
+            if vectorizer is None or tfidf_matrix is None:
+                raise ValueError(
+                    "vectorizer and tfidf_matrix must be provided when falling back to lexical search."
+                )
+            results = recommend_papers(
+                query=query,
+                papers=papers,
+                vectorizer=vectorizer,
+                matrix=tfidf_matrix,
+                top_k=top_k,
+            )
+            return results, "similarity", "Lexical Similarity (TF-IDF - Fallback)"
+
+        if vectorizer is None or tfidf_matrix is None:
+            raise ValueError(
+                "vectorizer and tfidf_matrix must be provided for hybrid retrieval."
+            )
+
+        results = recommend_hybrid(
+            query=query,
+            papers=papers,
+            vectorizer=vectorizer,
+            tfidf_matrix=tfidf_matrix,
+            semantic_embeddings=semantic_embeddings,
+            semantic_model=semantic_model,
+            top_k=top_k,
+            rrf_k=rrf_k,
+            lexical_weight=lexical_weight,
+            semantic_weight=semantic_weight,
+            candidate_pool_size=candidate_pool_size,
+        )
+        return results, "rrf_score", "RRF Ranking Score"
+
+    elif resolved_mode == "semantic":
+        if semantic_embeddings is None:
+            logger.warning(
+                "Semantic embeddings unavailable for semantic retrieval. "
+                "Falling back to Lexical (TF-IDF) search."
+            )
+            if vectorizer is None or tfidf_matrix is None:
+                raise ValueError(
+                    "vectorizer and tfidf_matrix must be provided when falling back to lexical search."
+                )
+            results = recommend_papers(
+                query=query,
+                papers=papers,
+                vectorizer=vectorizer,
+                matrix=tfidf_matrix,
+                top_k=top_k,
+            )
+            return results, "similarity", "Lexical Similarity (TF-IDF - Fallback)"
+
+        results = recommend_semantic(
+            query=query,
+            papers=papers,
+            embeddings=semantic_embeddings,
+            model=semantic_model,
+            top_k=top_k,
+        )
+        return results, "similarity", "Semantic Cosine Similarity"
+
+    else:  # resolved_mode == "lexical"
+        if vectorizer is None or tfidf_matrix is None:
+            raise ValueError(
+                "vectorizer and tfidf_matrix must be provided for lexical retrieval."
+            )
+        results = recommend_papers(
+            query=query,
+            papers=papers,
+            vectorizer=vectorizer,
+            matrix=tfidf_matrix,
+            top_k=top_k,
+        )
+        return results, "similarity", "Lexical Similarity (TF-IDF)"
 
 
 # ---------------------------------------------------------------------------
@@ -527,9 +750,14 @@ def get_related_papers(
     # Exclude the target paper itself
     results = results[results.index != target_idx]
     results = results[results["similarity"] > 0]
+    sort_cols = ["similarity", "title"]
+    sort_asc = [False, True]
+    if "id" in results.columns:
+        sort_cols.append("id")
+        sort_asc.append(True)
     results = results.sort_values(
-        by=["similarity", "title"],
-        ascending=[False, True],
+        by=sort_cols,
+        ascending=sort_asc,
     )
 
     return results.head(top_k).reset_index(drop=True)
