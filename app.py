@@ -20,6 +20,7 @@ from src.recommender import (
     export_to_bibtex,
     get_related_papers,
     get_semantic_model,
+    load_or_compute_embeddings,
     load_papers,
     recommend_hybrid,
     recommend_papers,
@@ -129,7 +130,11 @@ def get_semantic_engine(papers: pd.DataFrame):
     """
     try:
         model = get_semantic_model(DEFAULT_SEMANTIC_MODEL)
-        embeddings = build_semantic_embeddings(papers, model=model)
+        embeddings = load_or_compute_embeddings(
+            papers,
+            model=model,
+            model_name=DEFAULT_SEMANTIC_MODEL,
+        )
         return model, embeddings, None
     except Exception as exc:
         logger.warning("Semantic search engine unavailable: %s", exc)

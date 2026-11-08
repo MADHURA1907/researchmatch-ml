@@ -9,8 +9,11 @@ Provides content-based and semantic retrieval for research papers:
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -22,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "papers.csv"
+DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "embeddings_cache"
 DEFAULT_SEMANTIC_MODEL = "all-MiniLM-L6-v2"
 DEFAULT_RRF_K = 60
 
@@ -193,6 +197,141 @@ def build_semantic_embeddings(
         normalize_embeddings=True,
     )
     return np.asarray(embeddings, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Persistent Semantic Embedding Cache
+# ---------------------------------------------------------------------------
+
+def compute_corpus_hash(
+    papers: pd.DataFrame,
+    model_name: str = DEFAULT_SEMANTIC_MODEL,
+) -> str:
+    """Compute a deterministic SHA-256 fingerprint for paper content and model identity.
+
+    Accounts for title, abstract, category, row ordering, and the embedding model identifier.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(str(model_name).strip().encode("utf-8"))
+    hasher.update(b"\0")
+
+    if papers is None or papers.empty:
+        hasher.update(b"__empty__")
+        return hasher.hexdigest()
+
+    for _, row in papers.iterrows():
+        title = normalize_text(row.get("title", ""))
+        abstract = normalize_text(row.get("abstract", ""))
+        category = normalize_text(row.get("category", ""))
+        doc = f"Title: {title}. Abstract: {abstract} Category: {category}"
+        hasher.update(doc.encode("utf-8"))
+        hasher.update(b"\0")
+
+    return hasher.hexdigest()
+
+
+def save_embeddings(
+    embeddings: np.ndarray,
+    cache_path: Union[str, Path],
+) -> Path:
+    """Save embeddings to disk safely using atomic file replacement.
+
+    Validates array shape, dtype, and finiteness before saving.
+    """
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    arr = np.asarray(embeddings, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Embeddings must be a 2D array, got shape {arr.shape}.")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Embeddings contain NaN or infinite values.")
+
+    # Write to a temporary file in the same directory, then atomically replace
+    temp_file = cache_path.with_suffix(f".tmp.{os.getpid()}_{np.random.randint(1e9)}.npy")
+    try:
+        with open(temp_file, "wb") as f:
+            np.save(f, arr, allow_pickle=False)
+        temp_file.replace(cache_path)
+    except Exception:
+        if temp_file.exists():
+            temp_file.unlink(missing_ok=True)
+        raise
+
+    return cache_path
+
+
+def validate_embeddings(
+    embeddings: Any,
+    expected_rows: Optional[int] = None,
+) -> np.ndarray:
+    """Validate loaded embeddings array for type, shape, and finiteness."""
+    if not isinstance(embeddings, np.ndarray):
+        raise ValueError("Loaded object is not a NumPy ndarray.")
+    if not np.issubdtype(embeddings.dtype, np.floating):
+        raise ValueError(f"Expected floating point dtype, got {embeddings.dtype}.")
+    if embeddings.ndim != 2:
+        raise ValueError(f"Expected 2D array, got shape {embeddings.shape}.")
+    if expected_rows is not None and embeddings.shape[0] != expected_rows:
+        raise ValueError(
+            f"Embedding row count ({embeddings.shape[0]}) does not match "
+            f"expected count ({expected_rows})."
+        )
+    if embeddings.shape[1] == 0:
+        raise ValueError("Embedding feature dimension cannot be 0.")
+    if not np.all(np.isfinite(embeddings)):
+        raise ValueError("Loaded embeddings contain NaN or infinite values.")
+    return embeddings.astype(np.float32, copy=False)
+
+
+def load_or_compute_embeddings(
+    papers: pd.DataFrame,
+    model: Optional[Any] = None,
+    model_name: str = DEFAULT_SEMANTIC_MODEL,
+    cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR,
+    force_compute: bool = False,
+) -> np.ndarray:
+    """Load cached embeddings if valid; otherwise compute, validate, and persist them.
+
+    Returns float32 embeddings array of shape (len(papers), embedding_dim).
+    """
+    if papers is None or papers.empty:
+        return np.empty((0, 384), dtype=np.float32)
+
+    cache_dir = Path(cache_dir)
+    corpus_hash = compute_corpus_hash(papers, model_name=model_name)
+    safe_model = re.sub(r"[^\w\-]", "_", str(model_name).strip())
+    cache_file = cache_dir / f"embeddings_{safe_model}_{corpus_hash}.npy"
+
+    if not force_compute and cache_file.is_file():
+        try:
+            with open(cache_file, "rb") as f:
+                loaded = np.load(f, allow_pickle=False)
+            validated = validate_embeddings(loaded, expected_rows=len(papers))
+            logger.info("Loaded valid semantic embeddings from cache: %s", cache_file)
+            return validated
+        except Exception as exc:
+            logger.warning(
+                "Invalid or corrupted embedding cache at %s (%s). Recomputing...",
+                cache_file,
+                exc,
+            )
+            try:
+                cache_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # Cache miss or invalid cache: compute embeddings
+    embeddings = build_semantic_embeddings(papers, model=model, model_name=model_name)
+    validated = validate_embeddings(embeddings, expected_rows=len(papers))
+
+    try:
+        save_embeddings(validated, cache_file)
+        logger.info("Persisted semantic embeddings to cache: %s", cache_file)
+    except Exception as exc:
+        logger.warning("Failed to persist embeddings to cache at %s: %s", cache_file, exc)
+
+    return validated
 
 
 def recommend_semantic(
@@ -468,4 +607,3 @@ def export_to_bibtex(papers: pd.DataFrame) -> str:
         entries.append(entry)
 
     return "\n\n".join(entries)
-

@@ -6,18 +6,22 @@ import pandas as pd
 import pytest
 
 from src.recommender import (
-    escape_bibtex,
-    export_to_bibtex,
     DEFAULT_RRF_K,
     build_recommender,
     build_semantic_embeddings,
+    compute_corpus_hash,
+    escape_bibtex,
+    export_to_bibtex,
     get_related_papers,
     get_semantic_model,
+    load_or_compute_embeddings,
     load_papers,
     normalize_text,
     recommend_hybrid,
     recommend_papers,
     recommend_semantic,
+    save_embeddings,
+    validate_embeddings,
 )
 
 
@@ -106,7 +110,7 @@ def test_invalid_dataset_path_raises_error():
 
 
 # ---------------------------------------------------------------------------
-# New Tests: Preprocessing & Data Validation
+# Preprocessing & Data Validation
 # ---------------------------------------------------------------------------
 
 def test_normalize_text_helper():
@@ -141,7 +145,7 @@ def test_load_papers_missing_required_column(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# New Tests: Semantic Search (Mocked for speed and deterministic testing)
+# Semantic Search (Mocked for speed and deterministic testing)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -205,7 +209,7 @@ def test_recommend_semantic_dimension_mismatch(mock_embedding_env):
 
 
 # ---------------------------------------------------------------------------
-# New Tests: Hybrid Retrieval (Reciprocal Rank Fusion)
+# Hybrid Retrieval (Reciprocal Rank Fusion)
 # ---------------------------------------------------------------------------
 
 def test_recommend_hybrid_fuses_results(recommender, mock_embedding_env):
@@ -250,7 +254,7 @@ def test_recommend_hybrid_empty_query(recommender, mock_embedding_env):
 
 
 # ---------------------------------------------------------------------------
-# New Tests: Related Paper Recommendations (Item-to-Item)
+# Related Paper Recommendations (Item-to-Item)
 # ---------------------------------------------------------------------------
 
 def test_get_related_papers_excludes_self(recommender, mock_embedding_env):
@@ -373,3 +377,239 @@ def test_export_to_bibtex_with_author_if_present():
     assert r"author = {Alice Smith \& Bob Jones}" in bibtex
     assert "year = {2024}" in bibtex
 
+
+# ---------------------------------------------------------------------------
+# Persistent Embedding Cache Tests
+# ---------------------------------------------------------------------------
+
+def test_compute_corpus_hash_deterministic(recommender):
+    papers, _, _ = recommender
+    h1 = compute_corpus_hash(papers, model_name="all-MiniLM-L6-v2")
+    h2 = compute_corpus_hash(papers, model_name="all-MiniLM-L6-v2")
+    assert h1 == h2
+    assert len(h1) == 64  # SHA-256 hex string
+
+
+def test_compute_corpus_hash_different_content(recommender):
+    papers, _, _ = recommender
+    modified_papers = papers.copy()
+    modified_papers.loc[0, "title"] = "A Completely Modified Paper Title"
+    h_orig = compute_corpus_hash(papers)
+    h_mod = compute_corpus_hash(modified_papers)
+    assert h_orig != h_mod
+
+
+def test_compute_corpus_hash_row_order_sensitive(recommender):
+    papers, _, _ = recommender
+    reversed_papers = papers.iloc[::-1].reset_index(drop=True)
+    h_orig = compute_corpus_hash(papers)
+    h_rev = compute_corpus_hash(reversed_papers)
+    assert h_orig != h_rev
+
+
+def test_compute_corpus_hash_different_models(recommender):
+    papers, _, _ = recommender
+    h_model1 = compute_corpus_hash(papers, model_name="all-MiniLM-L6-v2")
+    h_model2 = compute_corpus_hash(papers, model_name="paraphrase-MiniLM-L3-v2")
+    assert h_model1 != h_model2
+
+
+def test_compute_corpus_hash_empty_dataset():
+    empty_df = pd.DataFrame()
+    h_empty = compute_corpus_hash(empty_df)
+    assert isinstance(h_empty, str)
+    assert len(h_empty) == 64
+
+
+def test_save_and_validate_embeddings_roundtrip(tmp_path):
+    target_file = tmp_path / "test_embeddings.npy"
+    rng = np.random.default_rng(42)
+    fake_embeddings = rng.standard_normal((10, 384)).astype(np.float32)
+
+    saved_path = save_embeddings(fake_embeddings, target_file)
+    assert saved_path == target_file
+    assert target_file.is_file()
+
+    with open(target_file, "rb") as f:
+        loaded = np.load(f, allow_pickle=False)
+
+    validated = validate_embeddings(loaded, expected_rows=10)
+    assert np.allclose(fake_embeddings, validated)
+    assert validated.dtype == np.float32
+
+
+def test_save_embeddings_invalid_shapes_or_values(tmp_path):
+    target_file = tmp_path / "bad_embeddings.npy"
+
+    # 1D array should fail
+    with pytest.raises(ValueError, match="must be a 2D array"):
+        save_embeddings(np.ones(10, dtype=np.float32), target_file)
+
+    # 3D array should fail
+    with pytest.raises(ValueError, match="must be a 2D array"):
+        save_embeddings(np.ones((2, 5, 10), dtype=np.float32), target_file)
+
+    # NaN values should fail
+    bad_arr = np.ones((5, 10), dtype=np.float32)
+    bad_arr[0, 0] = np.nan
+    with pytest.raises(ValueError, match="contain NaN or infinite"):
+        save_embeddings(bad_arr, target_file)
+
+    # Infinite values should fail
+    bad_arr[0, 0] = np.inf
+    with pytest.raises(ValueError, match="contain NaN or infinite"):
+        save_embeddings(bad_arr, target_file)
+
+
+def test_validate_embeddings_errors():
+    valid = np.ones((5, 10), dtype=np.float32)
+
+    # Row count mismatch
+    with pytest.raises(ValueError, match="row count .* does not match"):
+        validate_embeddings(valid, expected_rows=6)
+
+    # Zero feature dimension
+    with pytest.raises(ValueError, match="feature dimension cannot be 0"):
+        validate_embeddings(np.ones((5, 0), dtype=np.float32))
+
+    # Integer dtype
+    with pytest.raises(ValueError, match="Expected floating point dtype"):
+        validate_embeddings(np.ones((5, 10), dtype=np.int32))
+
+    # Non-ndarray
+    with pytest.raises(ValueError, match="Loaded object is not a NumPy ndarray"):
+        validate_embeddings([[1.0, 2.0], [3.0, 4.0]])
+
+
+def test_load_or_compute_embeddings_cache_miss_saves(recommender, tmp_path):
+    papers, _, _ = recommender
+    mock_model = MagicMock()
+    rng = np.random.default_rng(123)
+    fake_vecs = rng.standard_normal((len(papers), 384)).astype(np.float32)
+    mock_model.encode.return_value = fake_vecs
+
+    embeddings = load_or_compute_embeddings(
+        papers,
+        model=mock_model,
+        model_name="mock-model",
+        cache_dir=tmp_path,
+    )
+
+    assert mock_model.encode.call_count == 1
+    assert embeddings.shape == (len(papers), 384)
+    assert np.allclose(embeddings, fake_vecs)
+
+    # Verify file was written to tmp_path
+    cache_files = list(tmp_path.glob("*.npy"))
+    assert len(cache_files) == 1
+    assert "mock-model" in cache_files[0].name
+
+
+def test_load_or_compute_embeddings_cache_hit_avoids_recomputation(recommender, tmp_path):
+    papers, _, _ = recommender
+    mock_model = MagicMock()
+    rng = np.random.default_rng(456)
+    fake_vecs = rng.standard_normal((len(papers), 384)).astype(np.float32)
+    mock_model.encode.return_value = fake_vecs
+
+    # Run 1: Cache Miss
+    emb1 = load_or_compute_embeddings(
+        papers,
+        model=mock_model,
+        model_name="mock-hit-model",
+        cache_dir=tmp_path,
+    )
+    assert mock_model.encode.call_count == 1
+
+    # Run 2: Cache Hit (model.encode must NOT be called again)
+    emb2 = load_or_compute_embeddings(
+        papers,
+        model=mock_model,
+        model_name="mock-hit-model",
+        cache_dir=tmp_path,
+    )
+    assert mock_model.encode.call_count == 1
+    assert np.allclose(emb1, emb2)
+
+
+def test_load_or_compute_embeddings_changed_dataset_invalidates_cache(recommender, tmp_path):
+    papers, _, _ = recommender
+    mock_model = MagicMock()
+    rng = np.random.default_rng(789)
+    fake_vecs1 = rng.standard_normal((len(papers), 384)).astype(np.float32)
+    mock_model.encode.return_value = fake_vecs1
+
+    # Run 1: Original papers
+    load_or_compute_embeddings(
+        papers,
+        model=mock_model,
+        model_name="mock-inval-model",
+        cache_dir=tmp_path,
+    )
+    assert mock_model.encode.call_count == 1
+
+    # Modify papers
+    modified_papers = papers.copy()
+    modified_papers.loc[0, "abstract"] = "A modified abstract that triggers invalidation."
+    fake_vecs2 = rng.standard_normal((len(modified_papers), 384)).astype(np.float32)
+    mock_model.encode.return_value = fake_vecs2
+
+    # Run 2: Modified papers should cause cache miss and call model.encode again
+    load_or_compute_embeddings(
+        modified_papers,
+        model=mock_model,
+        model_name="mock-inval-model",
+        cache_dir=tmp_path,
+    )
+    assert mock_model.encode.call_count == 2
+    # Two distinct cache files should now exist
+    cache_files = list(tmp_path.glob("*.npy"))
+    assert len(cache_files) == 2
+
+
+def test_load_or_compute_embeddings_corrupted_cache_recovery(recommender, tmp_path):
+    papers, _, _ = recommender
+    corpus_hash = compute_corpus_hash(papers, model_name="mock-corrupt-model")
+    corrupt_file = tmp_path / f"embeddings_mock-corrupt-model_{corpus_hash}.npy"
+
+    # Write invalid / corrupt bytes to simulate a broken cache
+    corrupt_file.write_bytes(b"corrupted binary data that is not a valid numpy file")
+
+    mock_model = MagicMock()
+    rng = np.random.default_rng(999)
+    fake_vecs = rng.standard_normal((len(papers), 384)).astype(np.float32)
+    mock_model.encode.return_value = fake_vecs
+
+    recovered = load_or_compute_embeddings(
+        papers,
+        model=mock_model,
+        model_name="mock-corrupt-model",
+        cache_dir=tmp_path,
+    )
+
+    # Should catch the corruption, log warning, recompute, and overwrite with valid data
+    assert mock_model.encode.call_count == 1
+    assert np.allclose(recovered, fake_vecs)
+    assert corrupt_file.is_file()
+
+    # Verify corrupt_file is now valid numpy
+    with open(corrupt_file, "rb") as f:
+        re_loaded = np.load(f, allow_pickle=False)
+    assert np.allclose(re_loaded, fake_vecs)
+
+
+def test_load_or_compute_embeddings_empty_dataset(tmp_path):
+    empty_df = pd.DataFrame()
+    mock_model = MagicMock()
+
+    res = load_or_compute_embeddings(
+        empty_df,
+        model=mock_model,
+        model_name="mock-model",
+        cache_dir=tmp_path,
+    )
+
+    assert res.shape == (0, 384)
+    assert mock_model.encode.call_count == 0
+    # No cache file should be created for empty dataset
+    assert len(list(tmp_path.glob("*.npy"))) == 0
