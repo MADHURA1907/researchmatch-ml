@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from src.recommender import (
+    DEFAULT_CANDIDATE_POOL_SIZE,
     DEFAULT_RRF_K,
     DEFAULT_SEMANTIC_MODEL,
     build_recommender,
@@ -25,6 +26,7 @@ from src.recommender import (
     recommend_hybrid,
     recommend_papers,
     recommend_semantic,
+    search_papers,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,6 +197,58 @@ else:
         "Calculates cosine similarity on n-gram TF-IDF document-term vectors."
     )
 
+# RRF Configuration Parameters (shown only in Hybrid mode when semantic search is available)
+if "Hybrid" in selected_mode and semantic_available:
+    with st.sidebar.expander("⚡ Hybrid RRF Parameters", expanded=True):
+        lexical_weight = st.slider(
+            "Lexical Weight (TF-IDF)",
+            min_value=0.0,
+            max_value=2.0,
+            value=1.0,
+            step=0.1,
+            help="Weight assigned to lexical TF-IDF ranking in RRF fusion (0.0 = pure semantic).",
+        )
+        semantic_weight = st.slider(
+            "Semantic Weight (Dense)",
+            min_value=0.0,
+            max_value=2.0,
+            value=1.0,
+            step=0.1,
+            help="Weight assigned to dense semantic ranking in RRF fusion (0.0 = pure lexical).",
+        )
+        rrf_k = st.slider(
+            "RRF Constant (k)",
+            min_value=10,
+            max_value=100,
+            value=DEFAULT_RRF_K,
+            step=5,
+            help="Rank discount constant in RRF formula: weight / (k + rank). Higher k values smooth out ranking disparities.",
+        )
+        candidate_pool_size = st.slider(
+            "Candidate Pool Size",
+            min_value=1,
+            max_value=len(papers),
+            value=min(DEFAULT_CANDIDATE_POOL_SIZE, len(papers)),
+            step=1,
+            help=(
+                "Maximum candidates retrieved from each engine before rank fusion. "
+                "Note: A smaller candidate pool restricts candidate depth before "
+                "category and publication-year filters are applied, which may yield fewer results."
+            ),
+        )
+        st.caption(
+            "💡 *Smaller candidate pools evaluate fewer candidates from each engine, "
+            "which may limit available matches when category or year filters are applied.*"
+        )
+        if lexical_weight == 0.0 and semantic_weight == 0.0:
+            st.warning("⚠️ At least one weight must be greater than 0. Resetting semantic weight to 1.0.")
+            semantic_weight = 1.0
+else:
+    lexical_weight = 1.0
+    semantic_weight = 1.0
+    rrf_k = DEFAULT_RRF_K
+    candidate_pool_size = None
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🔍 Filters")
 
@@ -291,39 +345,35 @@ with tab_search:
 
     # Execute Search
     if search_query.strip():
-        # Retrieve candidate papers using selected engine
-        if "Hybrid" in selected_mode and semantic_available:
-            score_col_name = "rrf_score"
-            metric_label = "RRF Ranking Score"
-            results = recommend_hybrid(
-                query=search_query,
-                papers=papers,
-                vectorizer=vectorizer,
-                tfidf_matrix=tfidf_matrix,
-                semantic_embeddings=semantic_embeddings,
-                semantic_model=semantic_model,
-                top_k=len(papers),
-                rrf_k=DEFAULT_RRF_K,
-            )
-        elif "Semantic" in selected_mode and semantic_available:
-            score_col_name = "similarity"
-            metric_label = "Semantic Similarity"
-            results = recommend_semantic(
-                query=search_query,
-                papers=papers,
-                embeddings=semantic_embeddings,
-                model=semantic_model,
-                top_k=len(papers),
-            )
-        else:
-            score_col_name = "similarity"
-            metric_label = "Lexical Similarity (TF-IDF)"
-            results = recommend_papers(
-                query=search_query,
-                papers=papers,
-                vectorizer=vectorizer,
-                matrix=tfidf_matrix,
-                top_k=len(papers),
+        # Candidate pool size controls retrieval depth for hybrid search
+        search_top_k = (
+            candidate_pool_size
+            if (candidate_pool_size is not None and "Hybrid" in selected_mode)
+            else len(papers)
+        )
+
+        # Retrieve candidate papers using unified search dispatcher
+        results, score_col_name, metric_label = search_papers(
+            query=search_query,
+            papers=papers,
+            mode=selected_mode,
+            top_k=search_top_k,
+            vectorizer=vectorizer,
+            tfidf_matrix=tfidf_matrix,
+            semantic_embeddings=semantic_embeddings if semantic_available else None,
+            semantic_model=semantic_model if semantic_available else None,
+            rrf_k=rrf_k,
+            lexical_weight=lexical_weight,
+            semantic_weight=semantic_weight,
+            candidate_pool_size=candidate_pool_size,
+        )
+
+        # Inform user if candidate pool size limits the maximum possible results
+        if candidate_pool_size is not None and "Hybrid" in selected_mode and candidate_pool_size < top_k:
+            st.info(
+                f"ℹ️ **Candidate pool size ({candidate_pool_size}) is smaller than Max Results ({top_k})**: "
+                f"At most {candidate_pool_size} candidate papers were retrieved from each search engine "
+                "before rank fusion and filtering."
             )
 
         # Apply Category Filter
@@ -336,14 +386,23 @@ with tab_search:
             & (results["year"] <= selected_year_range[1])
         ]
 
-        # Apply Sorting
+        # Apply Sorting (preserving relevance ranking for secondary ties)
         if selected_sort == "Publication Year (Newest first)":
-            results = results.sort_values(by="year", ascending=False)
+            sort_cols = ["year", score_col_name, "title", "id"]
+            sort_asc = [False, False, True, True]
+            sort_cols = [c for c in sort_cols if c in results.columns]
+            results = results.sort_values(by=sort_cols, ascending=sort_asc[:len(sort_cols)])
         elif selected_sort == "Publication Year (Oldest first)":
-            results = results.sort_values(by="year", ascending=True)
+            sort_cols = ["year", score_col_name, "title", "id"]
+            sort_asc = [True, False, True, True]
+            sort_cols = [c for c in sort_cols if c in results.columns]
+            results = results.sort_values(by=sort_cols, ascending=sort_asc[:len(sort_cols)])
         elif selected_sort == "Title (A to Z)":
-            results = results.sort_values(by="title", ascending=True)
-        # Default is already sorted by relevance
+            sort_cols = ["title", score_col_name, "id"]
+            sort_asc = [True, False, True]
+            sort_cols = [c for c in sort_cols if c in results.columns]
+            results = results.sort_values(by=sort_cols, ascending=sort_asc[:len(sort_cols)])
+        # Default is already sorted by relevance via search_papers dispatcher
 
         # Slice to Top K
         displayed_results = results.head(top_k).reset_index(drop=True)
@@ -361,11 +420,12 @@ with tab_search:
             m1.metric("Retrieved Papers", len(displayed_results))
             m2.metric("Research Areas", displayed_results["category"].nunique())
             best_score = displayed_results[score_col_name].max()
-            if "Hybrid" in selected_mode:
+            if score_col_name == "rrf_score":
                 m3.metric("Top RRF Score", f"{best_score:.4f}")
             else:
                 m3.metric("Top Cosine Match", f"{best_score:.1%}")
-            m4.metric("Active Model", selected_mode.split()[0])
+            active_label = "TF-IDF (Fallback)" if "Fallback" in metric_label else selected_mode.split()[0]
+            m4.metric("Active Model", active_label)
 
             # Export Buttons
             export_cols = st.columns([1, 1, 4])
@@ -409,7 +469,7 @@ with tab_search:
 
                     with card_badge_col:
                         score_val = paper[score_col_name]
-                        if "Hybrid" in selected_mode:
+                        if score_col_name == "rrf_score":
                             st.metric(metric_label, f"{score_val:.4f}")
                         else:
                             st.metric(metric_label, f"{score_val:.1%}")
@@ -424,7 +484,7 @@ with tab_search:
                             st.caption("**Authors:** Not provided in dataset metadata")
 
                         # RRF Component ranks if in hybrid mode
-                        if "Hybrid" in selected_mode:
+                        if score_col_name == "rrf_score":
                             l_rank = paper.get("lexical_rank")
                             s_rank = paper.get("semantic_rank")
                             l_display = f"#{l_rank}" if pd.notna(l_rank) else "Not in top lexical"
